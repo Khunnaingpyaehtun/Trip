@@ -1,0 +1,58 @@
+{
+  "entities": {
+    "Expense": {
+      "title": "Expense",
+      "description": "An expense item incurred during the trip",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique ID of the expense"
+        },
+        "description": {
+          "type": "string",
+          "description": "Description of what was paid for"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Amount paid in Thai Baht (THB)"
+        },
+        "date": {
+          "type": "string",
+          "description": "ISO date string (YYYY-MM-DD)"
+        },
+        "paidBy": {
+          "type": "string",
+          "description": "Name of the person who paid"
+        },
+        "splitAmong": {
+          "type": "array",
+          "description": "List of member names participating in this expense"
+        }
+      },
+      "required": ["id", "description", "amount", "date", "paidBy", "splitAmong"]
+    },
+    "TripMeta": {
+      "title": "TripMeta",
+      "description": "Metadata for the trip including member list",
+      "type": "object",
+      "properties": {
+        "members": {
+          "type": "array",
+          "description": "Array of member names for the trip"
+        }
+      },
+      "required": ["members"]
+    }
+  },
+  "firestore": {
+    "/expenses/{expenseId}": {
+      "schema": "Expense",
+      "description": "Collection of all expenses recorded for the trip"
+    },
+    "/trip_config/{configId}": {
+      "schema": "TripMeta",
+      "description": "Configuration and metadata including the list of trip members"
+    }
+  }
+}

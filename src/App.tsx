@@ -11,8 +11,42 @@ import {
   UserPlus,
   MoreVertical,
   Pencil,
-  Trash2
+  Trash2,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  Download,
+  CheckCircle2,
+  Copy,
+  Check,
+  ExternalLink,
+  ArrowRightLeft,
+  Sparkles,
+  Upload
 } from 'lucide-react';
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  onSnapshot, 
+  arrayUnion, 
+  writeBatch,
+  getDocFromServer
+} from 'firebase/firestore';
+import { db } from './firebase.ts';
+
+// Test initial connection per Firebase skill guidelines
+async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.warn('Firebase client operating in offline mode.');
+    }
+  }
+}
+testConnection();
 
 export interface Expense {
   id: string;
@@ -37,11 +71,53 @@ export interface MemberBalance {
   };
 }
 
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errMsg = error instanceof Error ? error.message : String(error);
+  if (errMsg.toLowerCase().includes('permission') || errMsg.toLowerCase().includes('insufficient')) {
+    const errInfo: FirestoreErrorInfo = {
+      error: errMsg,
+      authInfo: {},
+      operationType,
+      path,
+    };
+    console.error('Firestore Error: ', JSON.stringify(errInfo));
+    throw new Error(JSON.stringify(errInfo));
+  }
+}
+
 export interface Settlement {
   from: string;
   to: string;
   amount: number;
 }
+
+export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
 
 interface AppContextType {
   expenses: Expense[];
@@ -50,6 +126,12 @@ interface AppContextType {
   deleteExpense: (id: string) => void;
   members: string[];
   addMember: (name: string) => void;
+  syncStatus: SyncStatus;
+  syncLocalDataToCloud: () => Promise<number>;
+  lastSyncedTime: Date | null;
+  importData: (rawInput: string) => Promise<{ expensesCount: number; membersCount: number }>;
+  importSuccessMessage: string | null;
+  clearImportSuccessMessage: () => void;
 }
 
 const DEFAULT_MEMBERS = [
@@ -102,28 +184,335 @@ const AppContext = createContext<AppContextType | null>(null);
 const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [expenses, setExpenses] = useLocalStorage<Expense[]>('trip-expenses-v2', []);
   const [members, setMembers] = useLocalStorage<string[]>('trip-members-v1', DEFAULT_MEMBERS);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('syncing');
+  const [lastSyncedTime, setLastSyncedTime] = useState<Date | null>(null);
+  const [importSuccessMessage, setImportSuccessMessage] = useState<string | null>(null);
 
-  const addExpense = (expense: Expense) => {
-    setExpenses(prev => [expense, ...prev]);
+  const clearImportSuccessMessage = () => setImportSuccessMessage(null);
+
+  // Import data handler (parses JSON, writes to Firestore & updates local storage)
+  const importData = async (rawInput: string): Promise<{ expensesCount: number; membersCount: number }> => {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawInput.trim());
+    } catch {
+      throw new Error('ထည့်သွင်းထားသော စာရင်း format မမှန်ကန်ပါ။ ကျေးဇူးပြု၍ JSON data ကို သေချာစစ်ဆေးပေးပါ။');
+    }
+
+    let incomingExpenses: Expense[] = [];
+    let incomingMembers: string[] = [];
+
+    if (Array.isArray(parsed)) {
+      incomingExpenses = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      if (Array.isArray(parsed.expenses)) {
+        incomingExpenses = parsed.expenses;
+      }
+      if (Array.isArray(parsed.members)) {
+        incomingMembers = parsed.members;
+      }
+    }
+
+    if (incomingExpenses.length === 0 && incomingMembers.length === 0) {
+      throw new Error('ထည့်သွင်းရန် စာရင်း (expenses) မတွေ့ရှိပါ။');
+    }
+
+    const validExpenses: Expense[] = incomingExpenses
+      .filter(e => e && typeof e === 'object' && e.description && e.amount !== undefined)
+      .map(e => ({
+        id: e.id || generateId(),
+        description: String(e.description || '').trim(),
+        amount: Number(e.amount) || 0,
+        date: e.date || new Date().toISOString().split('T')[0],
+        paidBy: e.paidBy || DEFAULT_MEMBERS[0],
+        splitAmong: Array.isArray(e.splitAmong) && e.splitAmong.length > 0 ? e.splitAmong : DEFAULT_MEMBERS,
+      }));
+
+    setSyncStatus('syncing');
+    const batch = writeBatch(db);
+    validExpenses.forEach(exp => {
+      batch.set(doc(db, 'expenses', exp.id), exp, { merge: true });
+    });
+
+    let mergedMembers = members;
+    if (incomingMembers.length > 0) {
+      mergedMembers = Array.from(new Set([...members, ...incomingMembers]));
+      batch.set(doc(db, 'trip_config', 'meta'), { members: mergedMembers }, { merge: true });
+    }
+
+    await batch.commit();
+
+    if (validExpenses.length > 0) {
+      setExpenses(prev => {
+        const incomingIds = new Set(validExpenses.map(e => e.id));
+        const combined = [...validExpenses, ...prev.filter(e => !incomingIds.has(e.id))];
+        combined.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        window.localStorage.setItem('trip-expenses-v2', JSON.stringify(combined));
+        return combined;
+      });
+    }
+
+    if (incomingMembers.length > 0) {
+      setMembers(mergedMembers);
+      window.localStorage.setItem('trip-members-v1', JSON.stringify(mergedMembers));
+    }
+
+    setSyncStatus('synced');
+    setLastSyncedTime(new Date());
+
+    return {
+      expensesCount: validExpenses.length,
+      membersCount: incomingMembers.length,
+    };
   };
 
-  const updateExpense = (expense: Expense) => {
+  // Auto-migration & real-time synchronization on mount
+  useEffect(() => {
+    let isSubscribed = true;
+
+    // Check URL parameters and hash for migration data
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      let importParam = urlParams.get('import_data');
+      if (!importParam && window.location.hash) {
+        const hash = window.location.hash.substring(1);
+        const hashParams = new URLSearchParams(hash);
+        importParam = hashParams.get('import_data');
+      }
+      if (importParam) {
+        const decodedStr = decodeURIComponent(importParam);
+        importData(decodedStr).then(({ expensesCount }) => {
+          setImportSuccessMessage(`Vercel မှ စာရင်း (${expensesCount}) ခုကို Cloud ပေါ်သို့ အောင်မြင်စွာ တင်သွင်းပြီးပါပြီ!`);
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }).catch(err => {
+          console.warn('URL auto-import error:', err);
+        });
+      }
+    } catch (e) {
+      console.warn('URL param parse error:', e);
+    }
+
+    // Expose console helper for quick manual import
+    (window as any).importTripData = async (data: any) => {
+      const input = typeof data === 'string' ? data : JSON.stringify(data);
+      const res = await importData(input);
+      console.log(`✅ Successfully imported ${res.expensesCount} expenses to Cloud Firestore!`);
+      return res;
+    };
+
+    // 1. Initial migration: if local storage has any expenses, push them to Firestore
+    const migrateLocalToCloud = async () => {
+      try {
+        const localRaw = window.localStorage.getItem('trip-expenses-v2');
+        if (localRaw) {
+          const localList: Expense[] = JSON.parse(localRaw);
+          if (Array.isArray(localList) && localList.length > 0) {
+            const batch = writeBatch(db);
+            let count = 0;
+            localList.forEach((exp) => {
+              if (exp && exp.id) {
+                const ref = doc(db, 'expenses', exp.id);
+                batch.set(ref, exp, { merge: true });
+                count++;
+              }
+            });
+            if (count > 0) {
+              await batch.commit();
+              console.log(`Auto-migrated ${count} local expenses to cloud.`);
+            }
+          }
+        }
+
+        // Migrate custom members if any
+        const localMemRaw = window.localStorage.getItem('trip-members-v1');
+        if (localMemRaw) {
+          const localMembers: string[] = JSON.parse(localMemRaw);
+          if (Array.isArray(localMembers) && localMembers.length > 0) {
+            const merged = Array.from(new Set([...DEFAULT_MEMBERS, ...localMembers]));
+            await setDoc(doc(db, 'trip_config', 'meta'), { members: merged }, { merge: true });
+          }
+        }
+      } catch (err) {
+        console.warn('Initial cloud migration notice:', err);
+      }
+    };
+
+    migrateLocalToCloud();
+
+    // 2. Real-time expenses listener
+    const unsubExpenses = onSnapshot(
+      collection(db, 'expenses'),
+      (snapshot) => {
+        if (!isSubscribed) return;
+        const cloudExpenses: Expense[] = [];
+        snapshot.forEach((docSnap) => {
+          const data = docSnap.data() as Expense;
+          if (data && data.id) {
+            cloudExpenses.push({
+              id: data.id || docSnap.id,
+              date: data.date || new Date().toISOString().split('T')[0],
+              description: data.description || 'Expense',
+              amount: Number(data.amount) || 0,
+              paidBy: data.paidBy || DEFAULT_MEMBERS[0],
+              splitAmong: Array.isArray(data.splitAmong) ? data.splitAmong : [],
+            });
+          }
+        });
+
+        // Ensure any locally cached expenses not yet present in snapshot get uploaded
+        try {
+          const localRaw = window.localStorage.getItem('trip-expenses-v2');
+          if (localRaw) {
+            const localList: Expense[] = JSON.parse(localRaw);
+            if (Array.isArray(localList) && localList.length > 0) {
+              const cloudIds = new Set(cloudExpenses.map(e => e.id));
+              const missingInCloud = localList.filter(e => !cloudIds.has(e.id));
+              if (missingInCloud.length > 0) {
+                missingInCloud.forEach(exp => {
+                  setDoc(doc(db, 'expenses', exp.id), exp, { merge: true }).catch(console.error);
+                  cloudExpenses.push(exp);
+                });
+              }
+            }
+          }
+        } catch {}
+
+        // Sort descending by date
+        cloudExpenses.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+        setExpenses(cloudExpenses);
+        window.localStorage.setItem('trip-expenses-v2', JSON.stringify(cloudExpenses));
+        setSyncStatus('synced');
+        setLastSyncedTime(new Date());
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'expenses');
+        setSyncStatus('offline');
+      }
+    );
+
+    // 3. Real-time trip members listener
+    const unsubMembers = onSnapshot(
+      doc(db, 'trip_config', 'meta'),
+      (docSnap) => {
+        if (!isSubscribed) return;
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (Array.isArray(data.members) && data.members.length > 0) {
+            const merged = Array.from(new Set([...DEFAULT_MEMBERS, ...data.members]));
+            setMembers(merged);
+            window.localStorage.setItem('trip-members-v1', JSON.stringify(merged));
+            return;
+          }
+        }
+        // Initialize doc in cloud if missing
+        setDoc(doc(db, 'trip_config', 'meta'), { members: DEFAULT_MEMBERS }, { merge: true }).catch(console.error);
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, 'trip_config/meta');
+      }
+    );
+
+    return () => {
+      isSubscribed = false;
+      unsubExpenses();
+      unsubMembers();
+    };
+  }, []);
+
+  const addExpense = async (expense: Expense) => {
+    // Optimistic local update
+    setExpenses(prev => [expense, ...prev.filter(e => e.id !== expense.id)]);
+    try {
+      setSyncStatus('syncing');
+      await setDoc(doc(db, 'expenses', expense.id), expense);
+      setSyncStatus('synced');
+      setLastSyncedTime(new Date());
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `expenses/${expense.id}`);
+      setSyncStatus('offline');
+    }
+  };
+
+  const updateExpense = async (expense: Expense) => {
+    // Optimistic local update
     setExpenses(prev => prev.map(e => e.id === expense.id ? expense : e));
+    try {
+      setSyncStatus('syncing');
+      await setDoc(doc(db, 'expenses', expense.id), expense, { merge: true });
+      setSyncStatus('synced');
+      setLastSyncedTime(new Date());
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `expenses/${expense.id}`);
+      setSyncStatus('offline');
+    }
   };
 
-  const deleteExpense = (id: string) => {
+  const deleteExpense = async (id: string) => {
+    // Optimistic local update
     setExpenses(prev => prev.filter(e => e.id !== id));
+    try {
+      setSyncStatus('syncing');
+      await deleteDoc(doc(db, 'expenses', id));
+      setSyncStatus('synced');
+      setLastSyncedTime(new Date());
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `expenses/${id}`);
+      setSyncStatus('offline');
+    }
   };
 
-  const addMember = (name: string) => {
+  const addMember = async (name: string) => {
     const trimmed = name.trim();
     if (trimmed && !members.includes(trimmed)) {
       setMembers(prev => [...prev, trimmed]);
+      try {
+        await setDoc(doc(db, 'trip_config', 'meta'), { members: arrayUnion(trimmed) }, { merge: true });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, 'trip_config/meta');
+      }
+    }
+  };
+
+  // Manual trigger to re-sync all local storage data to cloud
+  const syncLocalDataToCloud = async (): Promise<number> => {
+    setSyncStatus('syncing');
+    try {
+      const localRaw = window.localStorage.getItem('trip-expenses-v2');
+      const localList: Expense[] = localRaw ? JSON.parse(localRaw) : expenses;
+      let count = 0;
+      for (const exp of localList) {
+        if (exp && exp.id) {
+          await setDoc(doc(db, 'expenses', exp.id), exp, { merge: true });
+          count++;
+        }
+      }
+      await setDoc(doc(db, 'trip_config', 'meta'), { members }, { merge: true });
+      setSyncStatus('synced');
+      setLastSyncedTime(new Date());
+      return count;
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'expenses');
+      setSyncStatus('offline');
+      throw err;
     }
   };
 
   return (
-    <AppContext.Provider value={{ expenses, addExpense, updateExpense, deleteExpense, members, addMember }}>
+    <AppContext.Provider value={{ 
+      expenses, 
+      addExpense, 
+      updateExpense, 
+      deleteExpense, 
+      members, 
+      addMember,
+      syncStatus,
+      syncLocalDataToCloud,
+      lastSyncedTime,
+      importData,
+      importSuccessMessage,
+      clearImportSuccessMessage
+    }}>
       {children}
     </AppContext.Provider>
   );
@@ -647,7 +1036,7 @@ const EditExpenseModal: React.FC<{
   );
 };
 
-const ExpenseList: React.FC = () => {
+const ExpenseList: React.FC<{ onOpenVercelModal?: () => void }> = ({ onOpenVercelModal }) => {
   const context = useContext(AppContext);
   if (!context) throw new Error("ExpenseList must be used within AppProvider");
   const { expenses, updateExpense, deleteExpense, members, addMember } = context;
@@ -658,10 +1047,39 @@ const ExpenseList: React.FC = () => {
 
   if (expenses.length === 0) {
     return (
-      <div className="text-center py-20 text-gray-500 fade-in">
-        <List className="w-8 h-8 mx-auto mb-3 text-gray-300" />
-        <p>No expenses yet.</p>
-        <p className="text-xs text-gray-400 mt-1">Add your first expense to begin tracking.</p>
+      <div className="max-w-md mx-auto py-8 px-4 text-center fade-in">
+        <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-3 text-gray-400">
+          <List className="w-6 h-6" />
+        </div>
+        <h3 className="text-base font-medium text-gray-900 mb-1">No expenses yet</h3>
+        <p className="text-xs text-gray-500 mb-6">Add your first expense to begin tracking.</p>
+
+        {/* Vercel Import Card */}
+        {onOpenVercelModal && (
+          <div className="bg-amber-50/90 border border-amber-200/90 rounded-2xl p-4 text-left shadow-xs">
+            <div className="flex items-start gap-3">
+              <div className="p-2 bg-amber-100 text-amber-800 rounded-xl shrink-0 mt-0.5">
+                <ArrowRightLeft className="w-4 h-4" />
+              </div>
+              <div className="flex-1">
+                <h4 className="text-xs font-semibold text-amber-950 mb-1">
+                  trip-alpha-nine.vercel.app တွင် ဖြည့်ထားသော စာရင်းများရှိပါသလား?
+                </h4>
+                <p className="text-[11px] text-amber-800 leading-relaxed mb-3">
+                  သင်တို့ ယခင် Vercel တွင် ဖြည့်သွင်းထားသော စာရင်းများသည် မပျောက်မပျက် ရှိနေပါသည်။ ၎င်းတို့ကို ဤ Firebase Cloud Database စနစ်ထဲသို့ ၁ စက္ကန့်အတွင်း အလွယ်တကူ ပြောင်းရွှေ့နိုင်ပါသည်။
+                </p>
+                <button
+                  type="button"
+                  onClick={onOpenVercelModal}
+                  className="bg-amber-900 hover:bg-amber-950 text-white text-xs font-medium px-3.5 py-2 rounded-xl transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Vercel မှ Data များ ပြောင်းရွှေ့ရန် နှိပ်ပါ</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -669,10 +1087,24 @@ const ExpenseList: React.FC = () => {
   return (
     <div className="max-w-lg mx-auto fade-in">
       <div className="flex justify-between items-center mb-6">
-        <h2 className="text-xl font-medium text-gray-900">History</h2>
-        <span className="text-xs text-gray-500 font-medium bg-gray-100 px-2.5 py-1 rounded-full">
-          {expenses.length} {expenses.length === 1 ? 'item' : 'items'}
-        </span>
+        <div className="flex items-center gap-2">
+          <h2 className="text-xl font-medium text-gray-900">History</h2>
+          <span className="text-xs text-gray-500 font-medium bg-gray-100 px-2.5 py-1 rounded-full">
+            {expenses.length} {expenses.length === 1 ? 'item' : 'items'}
+          </span>
+        </div>
+
+        {onOpenVercelModal && (
+          <button
+            type="button"
+            onClick={onOpenVercelModal}
+            className="text-xs text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 font-medium flex items-center gap-1.5 px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
+            title="Import from trip-alpha-nine.vercel.app"
+          >
+            <ArrowRightLeft className="w-3 h-3 text-amber-700" />
+            <span>Import Vercel</span>
+          </button>
+        )}
       </div>
 
       <div className="space-y-3">
@@ -955,17 +1387,507 @@ const BalancesDashboard: React.FC = () => {
   );
 };
 
+const SyncStatusModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  onOpenVercelModal?: () => void;
+}> = ({ isOpen, onClose, onOpenVercelModal }) => {
+  const context = useContext(AppContext);
+  if (!context) return null;
+  const { syncStatus, syncLocalDataToCloud, expenses, members, lastSyncedTime } = context;
+
+  const [isSyncingManual, setIsSyncingManual] = useState(false);
+  const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
+
+  if (!isOpen) return null;
+
+  const handleManualSync = async () => {
+    setIsSyncingManual(true);
+    setSyncFeedback(null);
+    try {
+      const count = await syncLocalDataToCloud();
+      setSyncFeedback(`Data အားလုံး (${count} ခု) Cloud ပေါ်သို့ အောင်မြင်စွာ sync လုပ်ပြီးပါပြီ။`);
+    } catch {
+      setSyncFeedback('Sync လုပ်ရာတွင် အခက်အခဲရှိနေပါသည်။ ကျေးဇူးပြု၍ ခေတ္တစောင့်ပြီး ထပ်မံကြိုးစားပါ။');
+    } finally {
+      setIsSyncingManual(false);
+    }
+  };
+
+  const handleDownloadBackup = () => {
+    const backupData = {
+      exportedAt: new Date().toISOString(),
+      trip: "Split Trip Expenses",
+      members,
+      expenses,
+    };
+    const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `split-trip-backup-${new Date().toISOString().split('T')[0]}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+      <div className="fixed inset-0" onClick={onClose} />
+
+      <div className="relative bg-white rounded-2xl shadow-xl max-w-md w-full p-6 z-10 fade-in border border-gray-100">
+        <div className="flex justify-between items-center mb-5 pb-3 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <Cloud className="w-5 h-5 text-gray-800" />
+            <h3 className="text-lg font-semibold text-gray-900">Cloud Sync (အချိန်နှင့်တပြေးညီ)</h3>
+          </div>
+          <button 
+            type="button" 
+            onClick={onClose} 
+            className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          {/* Status Banner */}
+          <div className={`p-4 rounded-xl border flex items-start gap-3 ${
+            syncStatus === 'synced'
+              ? 'bg-emerald-50/80 border-emerald-200 text-emerald-900'
+              : syncStatus === 'syncing'
+              ? 'bg-blue-50/80 border-blue-200 text-blue-900'
+              : 'bg-amber-50/80 border-amber-200 text-amber-900'
+          }`}>
+            {syncStatus === 'synced' ? (
+              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            ) : syncStatus === 'syncing' ? (
+              <RefreshCw className="w-5 h-5 text-blue-600 shrink-0 mt-0.5 animate-spin" />
+            ) : (
+              <CloudOff className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            )}
+            <div className="text-sm">
+              <p className="font-semibold mb-0.5">
+                {syncStatus === 'synced' 
+                  ? 'Cloud Synced (အချက်အလက်များ ချိတ်ဆက်ပြီး)' 
+                  : syncStatus === 'syncing'
+                  ? 'Syncing... (Cloud သို့ တင်နေပါသည်)'
+                  : 'Offline (စက်တွင်း၌ သိမ်းဆည်းထားသည်)'}
+              </p>
+              <p className="text-xs text-gray-600 leading-relaxed">
+                {syncStatus === 'synced'
+                  ? 'ထည့်သွင်းထားသော စာရင်းများအားလုံး Cloud ပေါ်တွင် လုံခြုံစွာ သိမ်းဆည်းထားပြီး အဖွဲ့ဝင်အားလုံး ဖုန်း/ကွန်ပျူတာတိုင်းတွင် အချိန်နှင့်တပြေးညီ တပြိုင်နက် မြင်တွေ့နိုင်ပါသည်။'
+                  : syncStatus === 'syncing'
+                  ? 'အသစ်ထည့်သွင်း/ပြင်ဆင်ထားသော အချက်အလက်များကို Cloud ပေါ်သို့ တင်ပို့နေပါသည်...'
+                  : 'လက်ရှိ အင်တာနက် အဆင်မပြေပါကလည်း ထည့်သွင်းထားသော data များ မပျက်စီးစေရန် စက်တွင်း (Local Cache) တွင် အပြည့်အဝ မှတ်သားထားပါသည်။'}
+              </p>
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-2 gap-3 text-center">
+            <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
+              <span className="text-xs text-gray-500 block">စုစုပေါင်း စာရင်း</span>
+              <span className="text-xl font-semibold text-gray-900">{expenses.length} ခု</span>
+            </div>
+            <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
+              <span className="text-xs text-gray-500 block">အဖွဲ့ဝင် စုစုပေါင်း</span>
+              <span className="text-xl font-semibold text-gray-900">{members.length} ဦး</span>
+            </div>
+          </div>
+
+          {lastSyncedTime && (
+            <p className="text-center text-xs text-gray-400">
+              နောက်ဆုံး ချိတ်ဆက်ချိန်: {lastSyncedTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </p>
+          )}
+
+          {syncFeedback && (
+            <div className="p-3 bg-gray-50 rounded-lg text-xs text-gray-800 border border-gray-200">
+              {syncFeedback}
+            </div>
+          )}
+
+          {/* Action Buttons */}
+          <div className="space-y-2 pt-2">
+            <button 
+              type="button" 
+              onClick={handleManualSync}
+              disabled={isSyncingManual}
+              className="w-full bg-gray-900 hover:bg-gray-800 text-white font-medium py-2.5 rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer text-sm shadow-xs disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${isSyncingManual ? 'animate-spin' : ''}`} />
+              <span>စက်တွင်း Data များကို Cloud သို့ ပြန်လည် Sync လုပ်ရန်</span>
+            </button>
+
+            {onOpenVercelModal && (
+              <button 
+                type="button" 
+                onClick={() => {
+                  onClose();
+                  onOpenVercelModal();
+                }}
+                className="w-full bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 font-medium py-2.5 rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer text-sm"
+              >
+                <ArrowRightLeft className="w-4 h-4 text-amber-700" />
+                <span>trip-alpha-nine.vercel.app မှ Data ပြောင်းရွှေ့ရန်</span>
+              </button>
+            )}
+
+            <button 
+              type="button" 
+              onClick={handleDownloadBackup}
+              className="w-full bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2.5 rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer text-sm"
+            >
+              <Download className="w-4 h-4 text-gray-600" />
+              <span>Backup ဒေါင်းလုဒ်ရယူရန် (.JSON ဖိုင်)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const VercelMigrationModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+}> = ({ isOpen, onClose }) => {
+  const context = useContext(AppContext);
+  if (!context) return null;
+  const { importData } = context;
+
+  const [activeTab, setActiveTab] = useState<'script' | 'paste'>('script');
+  const [copied, setCopied] = useState(false);
+  const [pasteContent, setPasteContent] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  if (!isOpen) return null;
+
+  const currentAppUrl = window.location.origin + window.location.pathname;
+
+  const migrationScript = `location.href='${currentAppUrl}?import_data='+encodeURIComponent(JSON.stringify({expenses:JSON.parse(localStorage.getItem('trip-expenses-v2')||'[]'),members:JSON.parse(localStorage.getItem('trip-members-v1')||'[]')}))`;
+
+  const handleCopyScript = () => {
+    navigator.clipboard.writeText(migrationScript);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  };
+
+  const handlePasteImport = async () => {
+    if (!pasteContent.trim()) {
+      setStatusMessage({ type: 'error', text: 'ကျေးဇူးပြု၍ JSON data သို့မဟုတ် စာရင်းကို ထည့်သွင်းပေးပါ။' });
+      return;
+    }
+    setIsImporting(true);
+    setStatusMessage(null);
+    try {
+      const result = await importData(pasteContent);
+      setStatusMessage({
+        type: 'success',
+        text: `အောင်မြင်ပါသည်! စာရင်း (${result.expensesCount}) ခု နှင့် အဖွဲ့ဝင် (${result.membersCount}) ဦး ကို Cloud ပေါ်သို့ တင်သွင်းပြီးပါပြီ။`,
+      });
+      setTimeout(() => {
+        onClose();
+      }, 2000);
+    } catch (err: any) {
+      setStatusMessage({
+        type: 'error',
+        text: err?.message || 'Data တင်သွင်းရာတွင် အဆင်မပြေဖြစ်သွားပါသည်။ JSON format ကို ပြန်လည်စစ်ဆေးပေးပါ။',
+      });
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = event.target?.result as string;
+        if (text) {
+          setPasteContent(text);
+          setActiveTab('paste');
+        }
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+      <div className="fixed inset-0" onClick={onClose} />
+
+      <div className="relative bg-white rounded-2xl shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto z-10 p-6 fade-in border border-gray-100">
+        <div className="flex justify-between items-center mb-4 pb-3 border-b border-gray-100">
+          <div className="flex items-center gap-2">
+            <ArrowRightLeft className="w-5 h-5 text-indigo-600" />
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900">Vercel မှ Data ပြောင်းရွှေ့ရန်</h3>
+              <p className="text-xs text-gray-500">trip-alpha-nine.vercel.app ရှိ data များကို Cloud သို့ ရယူခြင်း</p>
+            </div>
+          </div>
+          <button 
+            type="button" 
+            onClick={onClose} 
+            className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Info callout */}
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 mb-5 text-xs text-amber-900 leading-relaxed">
+          <p className="font-semibold mb-1 flex items-center gap-1.5">
+            <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
+            Vercel တွင် ဖြည့်ထားသော စာရင်းများ ပျောက်မသွားပါ
+          </p>
+          <p>
+            သင်တို့ ဖြည့်ထားသော စာရင်းများသည် <code className="bg-amber-100 px-1 py-0.5 rounded font-mono">trip-alpha-nine.vercel.app</code> ၏ Browser Local Storage ထဲတွင် သိမ်းထားဆဲဖြစ်ပါသည်။ ၎င်းတို့ကို ဤ Firebase Cloud စနစ်သစ်ထဲသို့ အောက်ပါနည်းလမ်း ၂ မျိုးအနက် အဆင်ပြေရာဖြင့် ချက်ချင်း ပြောင်းရွှေ့နိုင်ပါသည်:
+          </p>
+        </div>
+
+        {/* Tab switcher */}
+        <div className="flex rounded-lg bg-gray-100 p-1 mb-5">
+          <button
+            type="button"
+            onClick={() => setActiveTab('script')}
+            className={`flex-1 py-2 text-xs font-medium rounded-md transition-all cursor-pointer ${
+              activeTab === 'script' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-900'
+            }`}
+          >
+            နည်းလမ်း ၁ - 1-Click Script (အလွယ်ဆုံး)
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('paste')}
+            className={`flex-1 py-2 text-xs font-medium rounded-md transition-all cursor-pointer ${
+              activeTab === 'paste' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-900'
+            }`}
+          >
+            နည်းလမ်း ၂ - Data တိုက်ရိုက် Paste ရန်
+          </button>
+        </div>
+
+        {activeTab === 'script' ? (
+          <div className="space-y-4">
+            <div className="space-y-3 text-xs text-gray-600">
+              <div className="flex items-start gap-2.5">
+                <span className="w-5 h-5 rounded-full bg-gray-900 text-white flex items-center justify-center font-bold shrink-0 text-[10px]">1</span>
+                <div>
+                  <p className="font-medium text-gray-800">အောက်ပါ ကူးယူခလုတ် (Copy Script) ကို နှိပ်ပါ:</p>
+                </div>
+              </div>
+
+              <div className="relative">
+                <textarea
+                  readOnly
+                  value={migrationScript}
+                  rows={3}
+                  className="w-full bg-gray-900 text-gray-100 p-3 rounded-xl font-mono text-[11px] leading-tight select-all focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={handleCopyScript}
+                  className="absolute right-2 top-2 bg-white/10 hover:bg-white/20 text-white px-2.5 py-1 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="text-emerald-400">Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Script</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="flex items-start gap-2.5 pt-1">
+                <span className="w-5 h-5 rounded-full bg-gray-900 text-white flex items-center justify-center font-bold shrink-0 text-[10px]">2</span>
+                <div>
+                  <p className="font-medium text-gray-800">
+                    <a 
+                      href="https://trip-alpha-nine.vercel.app/" 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="text-indigo-600 hover:underline font-semibold inline-flex items-center gap-1"
+                    >
+                      trip-alpha-nine.vercel.app <ExternalLink className="w-3 h-3" />
+                    </a> ဖွင့်ထားသော tab သို့ သွားပါ။
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2.5">
+                <span className="w-5 h-5 rounded-full bg-gray-900 text-white flex items-center justify-center font-bold shrink-0 text-[10px]">3</span>
+                <div>
+                  <p className="font-medium text-gray-800">
+                    Browser Console (F12 သို့မဟုတ် Inspect &gt; Console) တွင် Paste ချပြီး <kbd className="bg-gray-200 px-1 py-0.5 rounded text-[10px] font-mono">Enter</kbd> နှိပ်လိုက်ပါ။
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-0.5">
+                    (ဖုန်းတွင်ဖြစ်ပါက Address bar တွင် <code className="bg-gray-100 px-1 rounded font-mono">javascript:</code> ဟု ရိုက်ထည့်၍ အနောက်တွင် paste ချပြီး သွားနိုင်ပါသည်)
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2.5">
+                <span className="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center font-bold shrink-0 text-[10px]">✓</span>
+                <div>
+                  <p className="font-medium text-emerald-700">
+                    Vercel ရှိ စာရင်းအားလုံး ဤနေရာသို့ အလိုအလျောက် ပြောင်းရွှေ့ရောက်ရှိလာပြီး Cloud Database တွင် အဖွဲ့ဝင်အားလုံးအတွက် သိမ်းဆည်းသွားပါမည်!
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-xs text-gray-600">
+              <code className="bg-gray-100 px-1 py-0.5 rounded font-mono">trip-alpha-nine.vercel.app</code> ၏ Console တွင် <code className="bg-gray-100 px-1 py-0.5 rounded font-mono">copy(localStorage.getItem('trip-expenses-v2'))</code> ဟု ရိုက်၍ ရရှိလာသော စာရင်း JSON သို့မဟုတ် Backup JSON ကို အောက်တွင် paste ချပါ:
+            </p>
+
+            <textarea
+              value={pasteContent}
+              onChange={(e) => setPasteContent(e.target.value)}
+              placeholder='[{"id":"...","description":"Dinner","amount":1500,"paidBy":"Shan","splitAmong":["Shan",...]}]'
+              rows={5}
+              className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs font-mono focus:outline-none focus:border-gray-400 focus:bg-white transition-colors"
+            />
+
+            <div className="flex items-center justify-between">
+              <label className="text-xs text-gray-500 hover:text-gray-700 cursor-pointer flex items-center gap-1.5">
+                <Upload className="w-3.5 h-3.5" />
+                <span>JSON ဖိုင် ရွေးချယ်ရန်</span>
+                <input 
+                  type="file" 
+                  accept=".json" 
+                  onChange={handleFileUpload} 
+                  className="hidden" 
+                />
+              </label>
+
+              <button
+                type="button"
+                onClick={handlePasteImport}
+                disabled={isImporting || !pasteContent.trim()}
+                className="bg-gray-900 hover:bg-gray-800 text-white text-xs font-medium px-4 py-2 rounded-xl transition-colors disabled:opacity-50 flex items-center gap-2 cursor-pointer shadow-xs"
+              >
+                {isImporting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Importing...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>ယခု တင်သွင်းမည် (Import Now)</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {statusMessage && (
+              <div className={`p-3 rounded-xl text-xs flex items-center gap-2 ${
+                statusMessage.type === 'success' 
+                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' 
+                  : 'bg-red-50 text-red-800 border border-red-200'
+              }`}>
+                {statusMessage.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                )}
+                <span>{statusMessage.text}</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const MainApp: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'add' | 'list' | 'balances'>('add');
+  const [showSyncModal, setShowSyncModal] = useState(false);
+  const [showVercelModal, setShowVercelModal] = useState(false);
+  const context = useContext(AppContext);
+  const syncStatus = context?.syncStatus || 'synced';
+  const importSuccessMessage = context?.importSuccessMessage;
+  const clearImportSuccessMessage = context?.clearImportSuccessMessage;
 
   return (
     <div className="min-h-screen bg-white font-sans text-gray-900 pb-20 md:pb-8 selection:bg-gray-200">
+      {/* Import Notification Banner */}
+      {importSuccessMessage && (
+        <div className="bg-emerald-50 border-b border-emerald-200 px-4 py-2.5 flex items-center justify-between text-xs text-emerald-900 fade-in sticky top-0 z-50">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-medium">{importSuccessMessage}</span>
+          </div>
+          <button 
+            onClick={clearImportSuccessMessage}
+            className="text-emerald-700 hover:text-emerald-900 p-1 cursor-pointer"
+            title="Dismiss"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Header */}
       <header className="border-b border-gray-100 sticky top-0 bg-white/90 backdrop-blur-md z-40">
         <div className="max-w-4xl mx-auto px-4 md:px-6 h-14 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <h1 className="text-lg font-semibold tracking-tight text-gray-900">Split</h1>
             <span className="text-[11px] font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">Trip</span>
+            
+            {/* Real-time Cloud Sync Badge */}
+            <button 
+              onClick={() => setShowSyncModal(true)}
+              className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium transition-all cursor-pointer ${
+                syncStatus === 'synced'
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
+                  : syncStatus === 'syncing'
+                  ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                  : 'bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100'
+              }`}
+              title="Cloud Sync Status & Backup"
+            >
+              {syncStatus === 'synced' && (
+                <>
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                  <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                  <span className="text-[11px] hidden xs:inline">Synced</span>
+                </>
+              )}
+              {syncStatus === 'syncing' && (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                  <span className="text-[11px] hidden xs:inline">Syncing...</span>
+                </>
+              )}
+              {syncStatus === 'offline' && (
+                <>
+                  <CloudOff className="w-3.5 h-3.5 text-amber-600" />
+                  <span className="text-[11px] hidden xs:inline">Local</span>
+                </>
+              )}
+            </button>
+
+            {/* Import from Vercel button */}
+            <button
+              onClick={() => setShowVercelModal(true)}
+              className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 transition-colors cursor-pointer"
+              title="Import data from trip-alpha-nine.vercel.app"
+            >
+              <ArrowRightLeft className="w-3 h-3 text-amber-700" />
+              <span className="text-[11px] hidden sm:inline">Import Vercel</span>
+            </button>
           </div>
           
           {/* Desktop Navigation */}
@@ -1001,7 +1923,7 @@ const MainApp: React.FC = () => {
       {/* Main Content Area */}
       <main className="max-w-4xl mx-auto p-4 md:p-8 md:mt-4">
         {activeTab === 'add' && <AddExpenseForm onSave={() => setActiveTab('list')} />}
-        {activeTab === 'list' && <ExpenseList />}
+        {activeTab === 'list' && <ExpenseList onOpenVercelModal={() => setShowVercelModal(true)} />}
         {activeTab === 'balances' && <BalancesDashboard />}
       </main>
 
@@ -1039,6 +1961,19 @@ const MainApp: React.FC = () => {
           </button>
         </div>
       </nav>
+
+      {/* Cloud Sync Details Modal */}
+      <SyncStatusModal 
+        isOpen={showSyncModal} 
+        onClose={() => setShowSyncModal(false)}
+        onOpenVercelModal={() => setShowVercelModal(true)}
+      />
+
+      {/* Vercel Migration Modal */}
+      <VercelMigrationModal
+        isOpen={showVercelModal}
+        onClose={() => setShowVercelModal(false)}
+      />
     </div>
   );
 };
