@@ -8,7 +8,10 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronUp,
-  UserPlus
+  UserPlus,
+  MoreVertical,
+  Pencil,
+  Trash2
 } from 'lucide-react';
 
 export interface Expense {
@@ -43,6 +46,7 @@ export interface Settlement {
 interface AppContextType {
   expenses: Expense[];
   addExpense: (expense: Expense) => void;
+  updateExpense: (expense: Expense) => void;
   deleteExpense: (id: string) => void;
   members: string[];
   addMember: (name: string) => void;
@@ -103,6 +107,10 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     setExpenses(prev => [expense, ...prev]);
   };
 
+  const updateExpense = (expense: Expense) => {
+    setExpenses(prev => prev.map(e => e.id === expense.id ? expense : e));
+  };
+
   const deleteExpense = (id: string) => {
     setExpenses(prev => prev.filter(e => e.id !== id));
   };
@@ -115,7 +123,7 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   };
 
   return (
-    <AppContext.Provider value={{ expenses, addExpense, deleteExpense, members, addMember }}>
+    <AppContext.Provider value={{ expenses, addExpense, updateExpense, deleteExpense, members, addMember }}>
       {children}
     </AppContext.Provider>
   );
@@ -403,12 +411,250 @@ const AddExpenseForm: React.FC<{ onSave: () => void }> = ({ onSave }) => {
   );
 };
 
+const EditExpenseModal: React.FC<{
+  expense: Expense;
+  onClose: () => void;
+  onSave: (updated: Expense) => void;
+  members: string[];
+  addMember: (name: string) => void;
+}> = ({ expense, onClose, onSave, members, addMember }) => {
+  const [description, setDescription] = useState(expense.description);
+  const [amount, setAmount] = useState(expense.amount.toString());
+  const [date, setDate] = useState(expense.date);
+  const [paidBy, setPaidBy] = useState(expense.paidBy);
+  const [splitAmong, setSplitAmong] = useState<string[]>(expense.splitAmong);
+  const [error, setError] = useState('');
+  const [newMemberName, setNewMemberName] = useState('');
+
+  // Close on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  const toggleMember = (member: string) => {
+    setSplitAmong(prev => 
+      prev.includes(member) ? prev.filter(m => m !== member) : [...prev, member]
+    );
+  };
+
+  const selectAll = () => setSplitAmong([...members]);
+  const deselectAll = () => setSplitAmong([]);
+
+  const handleAddNewMember = () => {
+    const trimmed = newMemberName.trim();
+    if (trimmed && !members.includes(trimmed)) {
+      addMember(trimmed);
+      setSplitAmong(prev => [...prev, trimmed]);
+      setNewMemberName('');
+    }
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const parsedAmount = parseFloat(amount);
+    if (!description.trim() || isNaN(parsedAmount) || parsedAmount <= 0 || splitAmong.length === 0) {
+      setError('Please provide a description, valid amount, and select at least one person.');
+      return;
+    }
+
+    onSave({
+      ...expense,
+      description: description.trim(),
+      amount: parsedAmount,
+      date,
+      paidBy,
+      splitAmong,
+    });
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+      {/* Backdrop */}
+      <div className="fixed inset-0" onClick={onClose} />
+
+      <div className="relative bg-white rounded-2xl shadow-xl max-w-md w-full max-h-[90vh] overflow-y-auto z-10 p-6 fade-in border border-gray-100">
+        <div className="flex justify-between items-center mb-5 pb-3 border-b border-gray-100">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">Edit Expense</h3>
+            <p className="text-xs text-gray-500">Update expense details and split configuration</p>
+          </div>
+          <button 
+            type="button" 
+            onClick={onClose} 
+            className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100 transition-colors cursor-pointer"
+            title="Close"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-5">
+          {/* Basic Info */}
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+              <input 
+                type="text" 
+                placeholder="e.g. Dinner, Taxi, Hotel..." 
+                value={description} 
+                onChange={e => setDescription(e.target.value)}
+                className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 focus:bg-white transition-colors text-sm" 
+              />
+            </div>
+
+            <div className="flex gap-4">
+              <div className="flex-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Amount</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 font-medium text-sm">฿</span>
+                  <input 
+                    type="number" 
+                    min="0.01" 
+                    step="0.01" 
+                    placeholder="0.00" 
+                    value={amount} 
+                    onChange={e => setAmount(e.target.value)}
+                    className="w-full pl-8 pr-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 focus:bg-white transition-colors text-sm" 
+                  />
+                </div>
+              </div>
+              <div className="flex-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+                <input 
+                  type="date" 
+                  value={date} 
+                  onChange={e => setDate(e.target.value)}
+                  className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 focus:bg-white transition-colors text-sm" 
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Payer */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Paid by</label>
+            <div className="relative">
+              <select 
+                value={paidBy} 
+                onChange={e => setPaidBy(e.target.value)}
+                className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 focus:bg-white transition-colors appearance-none cursor-pointer pr-10 text-sm"
+              >
+                {members.map(m => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+              <ChevronDown className="w-4 h-4 text-gray-400 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            </div>
+          </div>
+
+          {/* Split Among */}
+          <div>
+            <div className="flex justify-between items-center mb-2">
+              <label className="block text-sm font-medium text-gray-700">
+                Split between ({splitAmong.length})
+              </label>
+              <div className="space-x-3 text-xs">
+                <button 
+                  type="button" 
+                  onClick={selectAll} 
+                  className="text-gray-500 hover:text-gray-900 cursor-pointer font-medium"
+                >
+                  All
+                </button>
+                <button 
+                  type="button" 
+                  onClick={deselectAll} 
+                  className="text-gray-500 hover:text-gray-900 cursor-pointer font-medium"
+                >
+                  None
+                </button>
+              </div>
+            </div>
+            
+            <div className="flex flex-wrap gap-1.5 mb-3 max-h-36 overflow-y-auto p-1 border border-gray-100 rounded-lg bg-gray-50/50">
+              {members.map(member => (
+                <button
+                  key={member}
+                  type="button"
+                  onClick={() => toggleMember(member)}
+                  className={`px-2.5 py-1 rounded-full text-xs transition-colors border cursor-pointer ${
+                    splitAmong.includes(member) 
+                      ? 'bg-gray-900 text-white border-gray-900 font-medium shadow-xs' 
+                      : 'bg-white text-gray-600 border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  {member}
+                </button>
+              ))}
+            </div>
+
+            {/* Add New Person Inline */}
+            <div className="flex gap-2">
+              <input 
+                type="text" 
+                placeholder="Add new person..." 
+                value={newMemberName} 
+                onChange={e => setNewMemberName(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleAddNewMember();
+                  }
+                }}
+                className="flex-1 px-3 py-1.5 text-xs bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 focus:bg-white transition-colors"
+              />
+              <button 
+                type="button" 
+                onClick={handleAddNewMember}
+                disabled={!newMemberName.trim()}
+                className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-medium rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+
+          {error && (
+            <div className="p-3 bg-red-50 text-red-600 rounded-lg text-sm flex items-center">
+              <AlertCircle className="w-4 h-4 mr-2 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="flex gap-3 pt-2">
+            <button 
+              type="button" 
+              onClick={onClose}
+              className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium py-2.5 rounded-lg transition-colors cursor-pointer text-sm"
+            >
+              Cancel
+            </button>
+            <button 
+              type="submit" 
+              className="flex-1 bg-gray-900 hover:bg-gray-800 text-white font-medium py-2.5 rounded-lg transition-colors cursor-pointer text-sm shadow-xs"
+            >
+              Save Changes
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 const ExpenseList: React.FC = () => {
   const context = useContext(AppContext);
   if (!context) throw new Error("ExpenseList must be used within AppProvider");
-  const { expenses, deleteExpense, members } = context;
+  const { expenses, updateExpense, deleteExpense, members, addMember } = context;
 
   const [deletePendingId, setDeletePendingId] = useState<string | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
 
   if (expenses.length === 0) {
     return (
@@ -433,7 +679,7 @@ const ExpenseList: React.FC = () => {
         {expenses.map((exp) => (
           <div 
             key={exp.id} 
-            className="bg-white p-4 rounded-lg border border-gray-100 shadow-xs flex justify-between items-center group hover:border-gray-200 transition-colors"
+            className="bg-white p-4 rounded-xl border border-gray-100 shadow-xs flex justify-between items-center group hover:border-gray-200 transition-colors relative"
           >
             <div className="flex-1 min-w-0 pr-4">
               <div className="flex items-center gap-2 mb-1">
@@ -454,36 +700,90 @@ const ExpenseList: React.FC = () => {
               </span>
 
               {deletePendingId === exp.id ? (
-                <div className="flex items-center gap-1.5 bg-red-50 p-1 rounded-md border border-red-100">
+                <div className="flex items-center gap-1.5 bg-red-50 p-1 rounded-lg border border-red-100 fade-in">
                   <button 
                     onClick={() => {
                       deleteExpense(exp.id);
                       setDeletePendingId(null);
                     }} 
-                    className="text-xs bg-red-600 hover:bg-red-700 text-white px-2 py-0.5 rounded font-medium transition-colors cursor-pointer"
+                    className="text-xs bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded font-medium transition-colors cursor-pointer"
                   >
                     Delete
                   </button>
                   <button 
                     onClick={() => setDeletePendingId(null)}
-                    className="text-xs text-gray-500 hover:text-gray-700 px-1 py-0.5 rounded cursor-pointer"
+                    className="text-xs text-gray-500 hover:text-gray-700 px-1.5 py-1 rounded cursor-pointer"
                   >
                     Cancel
                   </button>
                 </div>
               ) : (
-                <button 
-                  onClick={() => setDeletePendingId(exp.id)} 
-                  className="text-gray-300 hover:text-red-500 transition-colors p-1 rounded-md hover:bg-gray-50 cursor-pointer" 
-                  title="Delete expense"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                <div className="relative">
+                  <button 
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenMenuId(openMenuId === exp.id ? null : exp.id);
+                    }} 
+                    className={`p-1.5 rounded-lg transition-colors cursor-pointer ${
+                      openMenuId === exp.id 
+                        ? 'bg-gray-100 text-gray-900' 
+                        : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
+                    }`}
+                    title="Quick actions"
+                    aria-label="Quick actions"
+                  >
+                    <MoreVertical className="w-4 h-4" />
+                  </button>
+
+                  {openMenuId === exp.id && (
+                    <>
+                      <div 
+                        className="fixed inset-0 z-20" 
+                        onClick={() => setOpenMenuId(null)} 
+                      />
+                      <div className="absolute right-0 top-full mt-1.5 w-36 bg-white rounded-xl shadow-lg border border-gray-100 py-1.5 z-30 fade-in text-sm">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenMenuId(null);
+                            setEditingExpense(exp);
+                          }}
+                          className="w-full px-3 py-2 text-left text-gray-700 hover:bg-gray-50 flex items-center gap-2 transition-colors cursor-pointer"
+                        >
+                          <Pencil className="w-3.5 h-3.5 text-gray-500" />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setOpenMenuId(null);
+                            setDeletePendingId(exp.id);
+                          }}
+                          className="w-full px-3 py-2 text-left text-red-600 hover:bg-red-50 flex items-center gap-2 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-red-500" />
+                          <span>Delete</span>
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
               )}
             </div>
           </div>
         ))}
       </div>
+
+      {editingExpense && (
+        <EditExpenseModal
+          expense={editingExpense}
+          onClose={() => setEditingExpense(null)}
+          onSave={updateExpense}
+          members={members}
+          addMember={addMember}
+        />
+      )}
     </div>
   );
 };
